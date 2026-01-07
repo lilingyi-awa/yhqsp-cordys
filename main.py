@@ -1,0 +1,243 @@
+import asyncio
+import fastapi
+import sqlalchemy as sa
+from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+from config import SQLALCHEMY_URL, YUNHU_VERIFY_KEY, MISSKEY_DOMAIN, MISSKEY_SQLALCHEMY_URL
+import eapis
+import re
+import random
+from contextlib import asynccontextmanager
+from fastapi.responses import RedirectResponse, HTMLResponse
+import typing
+import time
+import json
+
+ORMBase = type("ORMBase", (DeclarativeBase, ), {})
+engine = create_async_engine(SQLALCHEMY_URL)
+mi_engine = create_async_engine(MISSKEY_SQLALCHEMY_URL)
+Session = async_sessionmaker(engine)
+
+@asynccontextmanager
+async def lifespan(_):
+    async with engine.begin() as conn:
+        await conn.run_sync(ORMBase.metadata.create_all)
+        del conn
+    asyncio.create_task(expire_clearer())
+    yield
+
+http = fastapi.FastAPI(lifespan=lifespan)
+
+class Registration(ORMBase):
+    __tablename__ = "registration"
+    userName: str = sa.Column(sa.String(45).with_variant(sa.String(45, 'ascii_bin'), 'mysql', 'mariadb'), primary_key=True)
+    yunhuId: typing.Optional[int] = sa.Column(sa.BigInteger(), nullable=True, unique=True)
+    userId: str = sa.Column(sa.String(45).with_variant(sa.String(45, 'ascii_bin'), 'mysql', 'mariadb'), nullable=True, unique=True)
+
+class LoginRequests(ORMBase):
+    __tablename__ = "login_request"
+    rid: int = sa.Column(sa.BigInteger(), primary_key=True, autoincrement=False)
+    secret: str = sa.Column(sa.String(32).with_variant(sa.String(32, 'ascii_bin'), 'mysql', 'mariadb'), nullable=False)
+    userName: str = sa.Column(sa.Text(), nullable=False)
+    expires: int = sa.Column(sa.BigInteger(), nullable=False, default=lambda: int(time.time()) + 600)
+
+async def expire_clearer():
+    while True:
+        try:
+            async with Session() as sess:
+                await sess.execute(
+                    sa.delete(LoginRequests)
+                    .where(LoginRequests.expires < int(time.time()))
+                )
+        except Exception:
+            pass
+        await asyncio.sleep(2)
+
+NAME_MATCH = re.compile(r"^[a-z0-9]{3,20}$")
+INT_MATCH = re.compile(r"^[1-9][0-9]*$")
+
+async def registration(uid: int, username: str):
+    password = "".join(random.choice("1234567890qwertyuiopasdfghjklzxcvbnmQWERTYUIOPASDFGHJKLZXCVBNM") for _ in range(0, 12))
+    if (INT_MATCH.match(username) and username != str(uid)) or not NAME_MATCH.match(username):
+        await eapis.deliverMessage(
+            uid=uid,
+            message="您输入的用户名不合法！",
+        )
+        return
+    async with Session() as session:
+        if (prereg := await session.scalar(sa.select(Registration).where(Registration.yunhuId == uid))) is not None:
+            await eapis.deliverMessage(
+                uid=uid,
+                message=f"您已经创建过账户，用户名：{prereg.userName}！如需创建多个账户，请联系管理员！",
+            )
+            return
+        if (prereg := await session.scalar(sa.select(Registration).where(Registration.userName == username))) is not None:
+            await eapis.deliverMessage(
+                uid=uid,
+                message=f"此用户名（{username}）已经被他人注册！",
+            )
+            return
+        result, userId = await eapis.createAccount(username, password)
+        if result == "ok":
+            asyncio.create_task(eapis.deliverMessage(
+                uid=uid,
+                message=f"账户注册成功！\n用户名：{username}\n初始密码：{password}",
+            ))
+            session.add(Registration(
+                userName=username,
+                yunhuId=uid,
+                userId=userId,
+            ))
+            await session.commit()
+        elif result == "duplicate":
+            asyncio.create_task(eapis.deliverMessage(
+                uid=uid,
+                message=f"此用户名（{username}）已经被他人注册！",
+            ))
+            session.add(Registration(userName=username))
+            await session.commit()
+        elif result == "authfail":
+            await eapis.deliverMessage(
+                uid=uid,
+                message="内部密钥过期，请联系管理员！",
+            )
+        else:
+            await eapis.deliverMessage(
+                uid=uid,
+                message="未知错误，请联系管理员！",
+            )
+
+async def rescue(uid: int):
+    async with Session() as session:
+        if (prereg := await session.scalar(sa.select(Registration).where(Registration.yunhuId == uid))) is None:
+            await eapis.deliverMessage(
+                uid=uid,
+                message="您并未创建账户！",
+            )
+            return
+    try:
+        repass = await eapis.rescuePassword(prereg.userId)
+        await eapis.deliverMessage(
+            uid=uid,
+            message=f"账户重设成功！\n用户名：{prereg.userName}\n密码：{repass}",
+        )
+    except Exception:
+        await eapis.deliverMessage(
+            uid=uid,
+            message="未知错误，请联系管理员！",
+        )
+
+async def whoami(uid: int):
+    async with Session() as session:
+        if (prereg := await session.scalar(sa.select(Registration).where(Registration.yunhuId == uid))) is None:
+            await eapis.deliverMessage(
+                uid=uid,
+                message="您并未创建账户！",
+            )
+            return
+    await eapis.deliverMessage(
+        uid=uid,
+        message=f"用户名：{prereg.userName}",
+    )
+
+async def whoisthey(uid: int, query: str):
+    if not NAME_MATCH.match(query):
+        await eapis.deliverMessage(
+            uid=uid,
+            message="未查询到记录！",
+        )
+    async with Session() as session:
+        target = await session.scalar(sa.select(Registration).where(Registration.userName == query))
+        if target is not None:
+            target = target.yunhuId
+    if target is not None:
+        await eapis.deliverMessage(
+            uid=uid,
+            message=f"对方云湖UID：{target}",
+        )
+    else:
+        await eapis.deliverMessage(
+            uid=uid,
+            message="未查询到记录！",
+        )
+
+@http.post("/yunhubot/receive")
+async def accept(req: fastapi.Request, secret: str):
+    if secret != YUNHU_VERIFY_KEY:
+        return None
+    code = await req.json()
+    if code["header"]["eventType"] == "message.receive.instruction":
+        if code["event"]["message"]["commandId"] == 2234:
+            asyncio.create_task(registration(
+                uid=int(code["event"]["sender"]["senderId"]),
+                username=code["event"]["message"]["content"]["text"],
+            ))
+        if code["event"]["message"]["commandId"] == 2235:
+            asyncio.create_task(rescue(int(code["event"]["sender"]["senderId"])))
+        if code["event"]["message"]["commandId"] == 2236:
+            asyncio.create_task(whoami(int(code["event"]["sender"]["senderId"])))
+        if code["event"]["message"]["commandId"] == 2239:
+            asyncio.create_task(whoisthey(
+                uid=int(code["event"]["sender"]["senderId"]),
+                query=code["event"]["message"]["content"]["text"],
+            ))
+        if code["event"]["message"]["commandId"] == 2240:
+            asyncio.create_task(quicklogin(int(code["event"]["sender"]["senderId"])))
+
+async def quicklogin(uid: int):
+    async with Session() as session:
+        if (prereg := await session.scalar(sa.select(Registration).where(Registration.yunhuId == uid))) is None:
+            await eapis.deliverMessage(
+                uid=uid,
+                message="您并未创建账户！",
+            )
+            return
+        rid = (int(time.time() * 1000 - 1767787667721) << 10) + random.randrange(0, 2048)
+        secret = ''.join(random.choice('1234567890qwertyuiopasdfghjklzxcvbnmQWERTYUIOPASDFGHJKLMNBVCXZ') for _ in range(0, 32))
+        session.add(LoginRequests(
+            rid=rid,
+            secret=secret,
+            userName=prereg.userName,
+        ))
+        del prereg
+        await session.commit()
+    await eapis.deliverMessage(
+        uid=uid,
+        message="请点击下面的按钮快捷登录（10分钟内有效，仅可使用一次）：",
+        buttons=[
+            {
+                "text": "登录",
+                "actionType": 1,
+                "url": f"https://{MISSKEY_DOMAIN}/yunhubot/vslogin/{rid}/{secret}"
+            }
+        ],
+    )
+
+@http.get("/yunhubot/vslogin/{rid}/{secret}")
+async def vslogin(rid: int, secret: str):
+    async with Session() as session:
+        record = await session.scalar(
+            sa.select(LoginRequests)
+            .where(LoginRequests.rid == rid)
+            .where(LoginRequests.secret == secret)
+            .where(LoginRequests.expires > int(time.time()))
+        )
+        if record is None:
+            return RedirectResponse("/")
+        userName = record.userName
+        await session.execute(sa.delete(LoginRequests).where(LoginRequests.rid == rid))
+        await session.commit()
+        del record
+    async with mi_engine.begin() as conn:
+        token: str = await conn.scalar(
+            sa.text('SELECT "user"."token" FROM "user" where "user"."username" = :username and "user"."host" is null'),
+            {"username": userName},
+        )
+        if token is None:
+            return RedirectResponse("/")
+    userdoc = await eapis.fetchUserdoc(token)
+    return HTMLResponse(f"<script>localStorage.account = JSON.stringify({json.dumps(userdoc)}); location.assign('/');</script>")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(http, host="0.0.0.0", port=14928)

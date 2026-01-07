@@ -1,0 +1,8 @@
+aiohttp
+fastapi
+uvicorn
+sqlalchemy
+aiomysql
+cryptography
+asyncpg
+psycopg2
