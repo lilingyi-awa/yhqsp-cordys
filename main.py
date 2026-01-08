@@ -3,7 +3,7 @@ import fastapi
 import sqlalchemy as sa
 from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
-from config import SQLALCHEMY_URL, YUNHU_VERIFY_KEY, MISSKEY_DOMAIN, MISSKEY_SQLALCHEMY_URL
+from config import SQLALCHEMY_URL, YUNHU_VERIFY_KEY, MISSKEY_DOMAIN, MISSKEY_SQLALCHEMY_URL, MISSKEY_ROOT_USER, DEFAULT_FOLLOW
 import eapis
 import re
 import random
@@ -12,14 +12,20 @@ from fastapi.responses import RedirectResponse, HTMLResponse
 import typing
 import time
 import json
+import aiohttp
 
 ORMBase = type("ORMBase", (DeclarativeBase, ), {})
 engine = create_async_engine(SQLALCHEMY_URL)
 mi_engine = create_async_engine(MISSKEY_SQLALCHEMY_URL)
 Session = async_sessionmaker(engine)
+miRootSec = ""
 
 @asynccontextmanager
 async def lifespan(_):
+    global miRootSec
+    token = await get_misskey_utoken(MISSKEY_ROOT_USER)
+    assert token is not None
+    miRootSec = token
     async with engine.begin() as conn:
         await conn.run_sync(ORMBase.metadata.create_all)
         del conn
@@ -56,7 +62,30 @@ async def expire_clearer():
 NAME_MATCH = re.compile(r"^[a-z0-9]{3,20}$")
 INT_MATCH = re.compile(r"^[1-9][0-9]*$")
 
-async def registration(uid: int, username: str):
+async def delegate_init(uid: int, username: str, nickname: str):
+    token = await get_misskey_utoken(username)
+    async with aiohttp.ClientSession() as session:
+        await session.post(
+            url=f"https://{MISSKEY_DOMAIN}/api/i/update",
+            json={
+                "name": nickname,
+                "fields":[
+                    {"name":"云湖号", "value":str(uid)}
+                ],
+                "i": token,
+            }
+        )
+        for follow in DEFAULT_FOLLOW:
+            await session.post(
+                url=f"https://{MISSKEY_DOMAIN}/api/following/create",
+                json={
+                    "userId": follow,
+                    "withReplies": True,
+                    "i": token,
+                }
+            )
+
+async def registration(uid: int, username: str, nickname: str):
     password = "".join(random.choice("1234567890qwertyuiopasdfghjklzxcvbnmQWERTYUIOPASDFGHJKLZXCVBNM") for _ in range(0, 12))
     if (INT_MATCH.match(username) and username != str(uid)) or not NAME_MATCH.match(username):
         await eapis.deliverMessage(
@@ -77,12 +106,13 @@ async def registration(uid: int, username: str):
                 message=f"此用户名（{username}）已经被他人注册！",
             )
             return
-        result, userId = await eapis.createAccount(username, password)
+        result, userId = await eapis.createAccount(username, password, rootSec=miRootSec)
         if result == "ok":
             asyncio.create_task(eapis.deliverMessage(
                 uid=uid,
                 message=f"账户注册成功！\n用户名：{username}\n初始密码：{password}",
             ))
+            asyncio.create_task(delegate_init(uid, username, nickname))
             session.add(Registration(
                 userName=username,
                 yunhuId=uid,
@@ -116,7 +146,7 @@ async def rescue(uid: int):
             )
             return
     try:
-        repass = await eapis.rescuePassword(prereg.userId)
+        repass = await eapis.rescuePassword(prereg.userId, rootSec=miRootSec)
         await eapis.deliverMessage(
             uid=uid,
             message=f"账户重设成功！\n用户名：{prereg.userName}\n密码：{repass}",
@@ -171,6 +201,7 @@ async def accept(req: fastapi.Request, secret: str):
             asyncio.create_task(registration(
                 uid=int(code["event"]["sender"]["senderId"]),
                 username=code["event"]["message"]["content"]["text"],
+                nickname=code["event"]["sender"]["senderNickname"],
             ))
         if code["event"]["message"]["commandId"] == 2235:
             asyncio.create_task(rescue(int(code["event"]["sender"]["senderId"])))
@@ -183,6 +214,24 @@ async def accept(req: fastapi.Request, secret: str):
             ))
         if code["event"]["message"]["commandId"] == 2240:
             asyncio.create_task(quicklogin(int(code["event"]["sender"]["senderId"])))
+    if code["header"]["eventType"] == "button.shortcut.menu":
+        if code["event"]["menuId"] == "VO9SDAQ9":
+            asyncio.create_task(quicklogin(int(code["event"]["senderId"])))
+
+@http.get("/identicon/{name}")
+async def identicon(name: str):
+    if name == "":
+        return RedirectResponse("https://cn.cravatar.com/avatar/")
+    name = name.split("@")
+    if len(name) != 2 or name[1] != MISSKEY_DOMAIN:
+        return RedirectResponse("https://cn.cravatar.com/avatar/")
+    name = name[0]
+    async with Session() as session:
+        if (prereg := await session.scalar(sa.select(Registration).where(Registration.userName == name))) is None:
+            return RedirectResponse("https://cn.cravatar.com/avatar/")
+        if prereg.yunhuId is None:
+            return RedirectResponse("https://cn.cravatar.com/avatar/")
+        return RedirectResponse(await eapis.getAvatarUrl(prereg.yunhuId))
 
 async def quicklogin(uid: int):
     async with Session() as session:
@@ -213,6 +262,13 @@ async def quicklogin(uid: int):
         ],
     )
 
+async def get_misskey_utoken(username: str) -> typing.Optional[str]:
+    async with mi_engine.begin() as conn:
+        return await conn.scalar(
+            sa.text('SELECT "user"."token" FROM "user" where "user"."username" = :username and "user"."host" is null'),
+            {"username": username},
+        )
+
 @http.get("/yunhubot/vslogin/{rid}/{secret}")
 async def vslogin(rid: int, secret: str):
     async with Session() as session:
@@ -228,13 +284,9 @@ async def vslogin(rid: int, secret: str):
         await session.execute(sa.delete(LoginRequests).where(LoginRequests.rid == rid))
         await session.commit()
         del record
-    async with mi_engine.begin() as conn:
-        token: str = await conn.scalar(
-            sa.text('SELECT "user"."token" FROM "user" where "user"."username" = :username and "user"."host" is null'),
-            {"username": userName},
-        )
-        if token is None:
-            return RedirectResponse("/")
+    token = await get_misskey_utoken(userName)
+    if token is None:
+        return RedirectResponse("/")
     userdoc = await eapis.fetchUserdoc(token)
     return HTMLResponse(f"<script>localStorage.account = JSON.stringify({json.dumps(userdoc)}); location.assign('/');</script>")
 

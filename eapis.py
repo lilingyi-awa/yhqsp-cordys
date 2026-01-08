@@ -1,8 +1,8 @@
 import aiohttp
-from config import MISSKEY_SECRET_KEY, YUNHU_SECRET_KEY, MISSKEY_DOMAIN
+from config import YUNHU_SECRET_KEY, MISSKEY_DOMAIN
 import typing
 
-async def createAccount(name: str, password: str) -> tuple[typing.Literal["ok", "authfail", "duplicate", "fatal"], str]:
+async def createAccount(name: str, password: str, rootSec: str) -> tuple[typing.Literal["ok", "authfail", "duplicate", "fatal"], str]:
     try:
         async with aiohttp.ClientSession() as session:
             result = await session.post(
@@ -10,7 +10,7 @@ async def createAccount(name: str, password: str) -> tuple[typing.Literal["ok", 
                 json={
                     "username": name,
                     "password": password,
-                    "i": MISSKEY_SECRET_KEY,
+                    "i": rootSec,
                 }
             )
             if result.status == 200:
@@ -26,13 +26,13 @@ async def createAccount(name: str, password: str) -> tuple[typing.Literal["ok", 
     except Exception:
         return ("fatal", "")
 
-async def rescuePassword(userId: str) -> str:
+async def rescuePassword(userId: str, rootSec: str) -> str:
     async with aiohttp.ClientSession() as session:
         result = await session.post(
             url="https://sk.lilingyi-awa.top/api/admin/reset-password",
             json={
                 "userId": userId,
-                "i": MISSKEY_SECRET_KEY,
+                "i": rootSec,
             }
         )
         assert result.status == 200
@@ -52,6 +52,16 @@ async def deliverMessage(uid: int, message: str, mtype: str = "text", buttons: l
                 },
             },
         )
+
+async def getAvatarUrl(uid: int):
+    async with aiohttp.ClientSession() as session:
+        custodian = (await (await session.get(url=f"https://chat-web-go.jwzhd.com/v1/user/homepage?userId={uid}")).json())["data"]["user"]
+        if custodian["userId"] == "https://cn.cravatar.com/avatar/":
+            return None
+        avatarUrl: str = custodian["avatarUrl"]
+        if avatarUrl.startswith("https://chat-img.jwznb.com/"):
+            avatarUrl = "https://jwznb-static.lilingyi-awa.top/" + avatarUrl.removeprefix("https://chat-img.jwznb.com/")
+        return avatarUrl
 
 async def fetchUserdoc(token: str) -> dict:
     async with aiohttp.ClientSession() as session:
