@@ -214,7 +214,7 @@ async def accept(req: fastapi.Request, secret: str):
             ))
         if code["event"]["message"]["commandId"] == 2240:
             asyncio.create_task(quicklogin(int(code["event"]["sender"]["senderId"])))
-    if code["header"]["eventType"] == "button.shortcut.menu":
+    if code["header"]["eventType"] == "bot.shortcut.menu":
         if code["event"]["menuId"] == "VO9SDAQ9":
             asyncio.create_task(quicklogin(int(code["event"]["senderId"])))
 
