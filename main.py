@@ -335,7 +335,18 @@ async def vslogin(rid: int, secret: str):
     if token is None:
         return RedirectResponse("/")
     userdoc = await eapis.fetchUserdoc(token)
-    return HTMLResponse(f"<script>localStorage.account = JSON.stringify({json.dumps(userdoc)}); location.assign('/');</script>")
+    with open("./loginer.js", "r", encoding="utf-8") as f:
+        neojs = f.read()
+    code = f"""
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"/><title>登录中...</title></head><body><h1>登录中...</h1>
+<script>
+window.userAccount = {json.dumps(userdoc)};
+localStorage.account = JSON.stringify(window.userAccount);
+{neojs}
+</script></body></html>
+"""
+    return HTMLResponse(code)
 
 if __name__ == "__main__":
     import uvicorn
