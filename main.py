@@ -30,6 +30,7 @@ async def lifespan(_):
         await conn.run_sync(ORMBase.metadata.create_all)
         del conn
     asyncio.create_task(expire_clearer())
+    asyncio.create_task(emoji_reductor())
     yield
 
 http = fastapi.FastAPI(lifespan=lifespan)
@@ -59,6 +60,28 @@ async def expire_clearer():
         except Exception:
             pass
         await asyncio.sleep(2)
+
+async def emoji_reductor():
+    QUERY_SQL = """
+SELECT
+    concat(':', e1.name, '@', e1.host, ':') as key,
+    concat(':', e1.name, ':') as value
+FROM
+    emoji e1 WHERE e1.host IN ('myce.li', 'nya.one', 'catpost.link', 'hub.imikufans.com', 'biii.li') AND
+    (SELECT e2.name from emoji e2 WHERE e1.name = e2.name and e2.host IS NULL) IS NOT NULL;
+"""
+    UPDATE_SQL = "UPDATE note_reaction set reaction = :value where reaction = :key"
+    while True:
+        await asyncio.sleep(2.1)
+        try:
+            async with mi_engine.begin() as conn:
+                result = await conn.execute(sa.text(QUERY_SQL))
+                for row in result:
+                    key, value = row._tuple()
+                    await conn.execute(UPDATE_SQL, {"key": key, "value": value})
+                await conn.commit()
+        except Exception:
+            pass
 
 NAME_MATCH = re.compile(r"^[a-z0-9]{3,20}$")
 INT_MATCH = re.compile(r"^[1-9][0-9]*$")
