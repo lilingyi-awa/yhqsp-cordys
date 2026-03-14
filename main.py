@@ -4,6 +4,7 @@ import sqlalchemy as sa
 from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from config import SQLALCHEMY_URL, YUNHU_VERIFY_KEY, MISSKEY_DOMAIN, MISSKEY_SQLALCHEMY_URL, MISSKEY_ROOT_USER, DEFAULT_FOLLOW
+from config import DIRECT_SOURCE, YUNHU_OAUTH_CLIENTID, YUNHU_OAUTH_CLIENTSEC
 import eapis
 import re
 import random
@@ -13,6 +14,10 @@ import typing
 import time
 import json
 import aiohttp
+import base64
+import hashlib
+from urllib.parse import quote
+from fastapi.params import Cookie
 
 ORMBase = type("ORMBase", (DeclarativeBase, ), {})
 engine = create_async_engine(SQLALCHEMY_URL)
@@ -49,6 +54,12 @@ class LoginRequests(ORMBase):
     userName: str = sa.Column(sa.Text(), nullable=False)
     expires: int = sa.Column(sa.BigInteger(), nullable=False, default=lambda: int(time.time()) + 600)
 
+class OAuthRequests(ORMBase):
+    __tablename__ = "oauth_request"
+    rid1: int = sa.Column(sa.BigInteger(), primary_key=True, autoincrement=False)
+    rid2: str = sa.Column(sa.String(32).with_variant(sa.String(32, 'ascii_bin'), 'mysql', 'mariadb'), primary_key=True)
+    expires: int = sa.Column(sa.BigInteger(), nullable=False, default=lambda: int(time.time()) + 600)
+
 async def expire_clearer():
     while True:
         try:
@@ -56,6 +67,10 @@ async def expire_clearer():
                 await sess.execute(
                     sa.delete(LoginRequests)
                     .where(LoginRequests.expires < int(time.time()))
+                )
+                await sess.execute(
+                    sa.delete(OAuthRequests)
+                    .where(OAuthRequests.expires < int(time.time()))
                 )
         except Exception:
             pass
@@ -339,6 +354,50 @@ async def get_misskey_utoken(username: str) -> typing.Optional[str]:
             {"username": username},
         )
 
+@http.get("/files/{webpublickey}")
+async def webpublic(webpublickey: str, req: fastapi.Request):
+    SQL = 'SELECT uri FROM drive_file WHERE "webpublicAccessKey" = :key LIMIT 1'
+    async with mi_engine.begin() as conn:
+        uri = await conn.scalar(sa.text(SQL), {"key": webpublickey})
+        if not isinstance(uri, str) or uri == "":
+            return fastapi.responses.Response(status_code=404)
+        for allowance in DIRECT_SOURCE:
+            if uri.startswith(allowance):
+                return fastapi.responses.RedirectResponse(uri)
+    async def reader_iv():
+        async with aiohttp.ClientSession() as sess:
+            result = await sess.get(
+                url=uri,
+                headers={k: v for k, v in req.headers.items() if k.lower() in ["range", "sec-fetch-dest", "sec-fetch-mode"]}
+            )
+            yield result.status
+            if result.status >= 400:
+                yield {}
+                yield b""
+                return
+            yield result.headers
+            ran = result.content
+            while True:
+                block = await ran.readany()
+                if not block:
+                    break
+                yield block
+    iv = reader_iv()
+    status = await iv.asend(None)
+    mutter = await iv.asend(None)
+    return fastapi.responses.StreamingResponse(
+        iv,
+        status_code=status,
+        headers={k: v for k, v in mutter.items() if k.lower() in [
+            "content-length",
+            "content-range",
+            "accept-ranges",
+            "etag",
+            "last-modified",
+        ]},
+        media_type=mutter.get("Content-Type", "image/webp"),
+    )
+
 @http.get("/yunhubot/vslogin/{rid}/{secret}")
 async def vslogin(rid: int, secret: str):
     async with Session() as session:
@@ -354,6 +413,9 @@ async def vslogin(rid: int, secret: str):
         await session.execute(sa.delete(LoginRequests).where(LoginRequests.rid == rid))
         await session.commit()
         del record
+    return await encore_make_login(userName)        
+
+async def encore_make_login(userName: str):
     token = await get_misskey_utoken(userName)
     if token is None:
         return RedirectResponse("/")
@@ -370,6 +432,62 @@ localStorage.account = JSON.stringify(window.userAccount);
 </script></body></html>
 """
     return HTMLResponse(code)
+
+@http.get("/yunhubot/oauth-invoke")
+async def oauth_invoke():
+    rid1 = (int(time.time() * 1000 - 1773475653968) << 10) + random.randrange(0, 2048)
+    rid2 = ''.join(random.choice('1234567890qwertyuiopasdfghjklzxcvbnmQWERTYUIOPASDFGHJKLMNBVCXZ') for _ in range(0, 32))
+    async with Session() as session:
+        session.add(OAuthRequests(rid1=rid1, rid2=rid2))
+        await session.commit()
+    goto = "https://oauth2.jwzhd.com/oauth/authorize"
+    goto += f"?response_type=code&client_id={YUNHU_OAUTH_CLIENTID}"
+    goto += f"&redirect_uri=https://{MISSKEY_DOMAIN}/yunhubot/oauth&callback&scope=profile&state={rid1}-{rid2}"
+    return RedirectResponse(goto)
+
+@http.get("/yunhubot/oauth")
+async def oauth_receive(code: str, state: str):
+    if not re.match(r"^[1-9][0-9]*\-[0-9a-zA-Z]{32}$", state):
+        return RedirectResponse("/")
+    rid1, rid2 = state.split("-")
+    async with Session() as session:
+        bob = await session.scalar(sa.select(OAuthRequests).where(OAuthRequests.rid1 == rid1).where(OAuthRequests.rid2 == rid2))
+        if bob is None:
+            return RedirectResponse("/")
+        await session.execute(sa.delete(OAuthRequests).where(OAuthRequests.rid1 == rid1).where(OAuthRequests.rid2 == rid2))
+        await session.commit()
+    async with aiohttp.ClientSession() as session:
+        result = await session.post(
+            url="https://oauth2.jwzhd.com/oauth/token",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            data=(
+                "grant_type=authorization_code"
+                f"&code={quote(code)}"
+                f"&redirect_uri=https://{MISSKEY_DOMAIN}/yunhubot/oauth"
+                f"&client_id={YUNHU_OAUTH_CLIENTID}&client_secret={YUNHU_OAUTH_CLIENTSEC}"
+            ),
+        )
+        result = await result.json()
+        if "access_token" not in result:
+            return RedirectResponse("/")
+        access_token = result["access_token"]
+        userdoc = await session.get(url="https://oauth2.jwzhd.com/api/userinfo", headers={"Authorization": "Bearer " + access_token})
+        userdoc = await userdoc.json()
+        user_id = userdoc["user_id"]
+    async with Session() as session:
+        if (account := await session.scalar(sa.select(Registration).where(Registration.yunhuId == int(user_id)))) is None:
+            repo = """
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"/><title>提示</title><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
+<body><p>您还没有注册账户，请在Cordys处操作完成注册。</p>
+<ul><li>机器人ID：91975597</li>
+<li>机器人链接：<a href="https://yhfx.jwznb.com/share?key=k8PKWfRWUGT0&ts=1773482829" style="color: black;">https://yhfx.jwznb.com/share?key=k8PKWfRWUGT0&ts=1773482829</a></li></ul>
+</body></html>
+"""
+            return HTMLResponse(repo)
+        else:
+            return await encore_make_login(account.userName)
 
 if __name__ == "__main__":
     import uvicorn
