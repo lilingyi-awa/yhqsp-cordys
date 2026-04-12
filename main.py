@@ -4,7 +4,7 @@ import sqlalchemy as sa
 from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from config import SQLALCHEMY_URL, YUNHU_VERIFY_KEY, MISSKEY_DOMAIN, MISSKEY_SQLALCHEMY_URL, MISSKEY_ROOT_USER, DEFAULT_FOLLOW
-from config import DIRECT_SOURCE, YUNHU_OAUTH_CLIENTID, YUNHU_OAUTH_CLIENTSEC
+from config import DIRECT_SOURCE, YUNHU_OAUTH_CLIENTID, YUNHU_OAUTH_CLIENTSEC, REQUEST_DELIVER_TO
 import eapis
 import re
 import random
@@ -14,10 +14,7 @@ import typing
 import time
 import json
 import aiohttp
-import base64
-import hashlib
 from urllib.parse import quote
-from fastapi.params import Cookie
 
 ORMBase = type("ORMBase", (DeclarativeBase, ), {})
 engine = create_async_engine(SQLALCHEMY_URL)
@@ -35,7 +32,6 @@ async def lifespan(_):
         await conn.run_sync(ORMBase.metadata.create_all)
         del conn
     asyncio.create_task(expire_clearer())
-    asyncio.create_task(emoji_reductor())
     yield
 
 http = fastapi.FastAPI(lifespan=lifespan)
@@ -75,28 +71,6 @@ async def expire_clearer():
         except Exception:
             pass
         await asyncio.sleep(2)
-
-async def emoji_reductor():
-    QUERY_SQL = """
-SELECT
-    concat(':', e1.name, '@', e1.host, ':') as key,
-    concat(':', e1.name, ':') as value
-FROM
-    emoji e1 WHERE e1.host IN ('myce.li', 'nya.one', 'catpost.link', 'hub.imikufans.com', 'biii.li') AND
-    (SELECT e2.name from emoji e2 WHERE e1.name = e2.name and e2.host IS NULL) IS NOT NULL;
-"""
-    UPDATE_SQL = "UPDATE note_reaction set reaction = :value where reaction = :key"
-    while True:
-        await asyncio.sleep(2.1)
-        try:
-            async with mi_engine.begin() as conn:
-                result = await conn.execute(sa.text(QUERY_SQL))
-                for row in result:
-                    key, value = row._tuple()
-                    await conn.execute(UPDATE_SQL, {"key": key, "value": value})
-                await conn.commit()
-        except Exception:
-            pass
 
 NAME_MATCH = re.compile(r"^[a-z0-9]{3,20}$")
 INT_MATCH = re.compile(r"^[1-9][0-9]*$")
@@ -239,6 +213,12 @@ async def whoisthey(uid: int, query: str):
             message="账户名：{query}\n类型：IAS账户\n云湖UID（创建者）：无",
         )
 
+async def accept_fun_request(uid: int, name: str, content: str):
+    await eapis.deliverMessage(
+        uid=REQUEST_DELIVER_TO,
+        message=f"收到申请！\n申请者：{name}（{uid}）\n申请内容：\n{content}",
+    )
+
 @http.post("/yunhubot/receive")
 async def accept(req: fastapi.Request, secret: str):
     if secret != YUNHU_VERIFY_KEY:
@@ -264,6 +244,12 @@ async def accept(req: fastapi.Request, secret: str):
             asyncio.create_task(quicklogin(int(code["event"]["sender"]["senderId"])))
         if code["event"]["message"]["commandId"] == 2273:
             asyncio.create_task(quicklogin_ias(int(code["event"]["sender"]["senderId"]), code["event"]["message"]["content"]["text"]))
+        if code["event"]["message"]["commandId"] == 2357:
+            asyncio.create_task(accept_fun_request(
+                code["event"]["sender"]["senderId"],
+                code["event"]["sender"]["senderNickname"],
+                code["event"]["message"]["content"]["text"]
+            ))
     if code["header"]["eventType"] == "bot.shortcut.menu":
         if code["event"]["menuId"] == "VO9SDAQ9":
             asyncio.create_task(quicklogin(int(code["event"]["senderId"])))
@@ -488,6 +474,55 @@ async def oauth_receive(code: str, state: str):
             return HTMLResponse(repo)
         else:
             return await encore_make_login(account.userName)
+
+@http.get('/nodeinfo/{version}')
+def nodeinfo(version: str):
+    return fastapi.responses.JSONResponse({
+        "version": version,
+        "software": {
+            "name": "sinokey",
+            "version": "2026.3.1-liliko",
+            "homepage": "https://misskey-social.com.cn"
+        },
+        "protocols": [
+            "activitypub",
+        ],
+        "services": {
+            "inbound": [],
+            "outbound": [
+                "atom1.0",
+                "rss2.0"
+            ]
+        },
+        # Vanity Claims
+        "usage": {
+            "users": {
+                "total": int((time.time() - 1700000000) * 8.0),
+                "activeHalfyear": int((time.time() - 1700000000) * 3.1),
+                "activeMonth": int((time.time() - 1700000000) * 0.91),
+            },
+            "localPosts": int((time.time() - 1500000000) * 19.6),
+            "localComments": int((time.time() - 1220000000) * 27.1),
+        },
+        "openRegistrations": True,
+        "metadata": {
+            "nodeName": "lilikoBBS",
+            "nodeDescription": "lilikoBBS（aka. 云湖QSpace）是一个普通的联邦宇宙实例。",
+            "nodeAdmins": [
+                {
+                    "name": "Prenext Inc.",
+                    "email": "alan_sudo@yeah.net"
+                }
+            ],
+            "maintainer": {
+                "name": "Prenext Inc.",
+                "email": "alan_sudo@yeah.net"
+            },
+            "langs": ["zh"],
+        },
+    }, headers={
+        "Content-Type": f"application/json; profile=\"http://nodeinfo.diaspora.software/ns/schema/{version}#\"; charset=utf-8",
+    })
 
 if __name__ == "__main__":
     import uvicorn
