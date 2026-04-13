@@ -494,16 +494,6 @@ def nodeinfo(version: str):
                 "rss2.0"
             ]
         },
-        # Vanity Claims
-        "usage": {
-            "users": {
-                "total": int((time.time() - 1700000000) * 8.0),
-                "activeHalfyear": int((time.time() - 1700000000) * 3.1),
-                "activeMonth": int((time.time() - 1700000000) * 0.91),
-            },
-            "localPosts": int((time.time() - 1500000000) * 19.6),
-            "localComments": int((time.time() - 1220000000) * 27.1),
-        },
         "openRegistrations": True,
         "metadata": {
             "nodeName": "lilikoBBS",
