@@ -56,6 +56,12 @@ class OAuthRequests(ORMBase):
     rid2: str = sa.Column(sa.String(32).with_variant(sa.String(32, 'ascii_bin'), 'mysql', 'mariadb'), primary_key=True)
     expires: int = sa.Column(sa.BigInteger(), nullable=False, default=lambda: int(time.time()) + 600)
 
+class OAuthRegisterToken(ORMBase):
+    __tablename__ = "oauth_register_token"
+    uid: int = sa.Column(sa.BigInteger(), primary_key=True, autoincrement=False)
+    secret: str = sa.Column(sa.String(32).with_variant(sa.String(32, 'ascii_bin'), 'mysql', 'mariadb'), nullable=False)
+    expires: int = sa.Column(sa.BigInteger(), nullable=False, default=lambda: int(time.time()) + 600)
+
 async def expire_clearer():
     while True:
         try:
@@ -68,6 +74,11 @@ async def expire_clearer():
                     sa.delete(OAuthRequests)
                     .where(OAuthRequests.expires < int(time.time()))
                 )
+                await sess.execute(
+                    sa.delete(OAuthRegisterToken)
+                    .where(OAuthRegisterToken.expires < int(time.time()))
+                )
+                await sess.commit()
         except Exception:
             pass
         await asyncio.sleep(2)
@@ -462,18 +473,84 @@ async def oauth_receive(code: str, state: str):
         user_id = userdoc["user_id"]
     async with Session() as session:
         if (account := await session.scalar(sa.select(Registration).where(Registration.yunhuId == int(user_id)))) is None:
-            repo = """
-<!DOCTYPE html>
-<html>
-<head><meta charset="utf-8"/><title>提示</title><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
-<body><p>您还没有注册账户，请在Cordys处操作完成注册。</p>
-<ul><li>机器人ID：91975597</li>
-<li>机器人链接：<a href="https://yhfx.jwznb.com/share?key=k8PKWfRWUGT0&ts=1773482829" style="color: black;">https://yhfx.jwznb.com/share?key=k8PKWfRWUGT0&ts=1773482829</a></li></ul>
-</body></html>
-"""
-            return HTMLResponse(repo)
+            secret = "".join(random.choice("1234567890qwertyuiopasdfghjklzxcvbnmQWERTYUIOPASDFGHJKLZXCVBNM") for _ in range(0, 32))
+            await session.merge(OAuthRegisterToken(
+                uid=int(user_id),
+                secret=secret,
+                expires=int(time.time()) + 600,
+            ))
+            req = RedirectResponse("/yunhubot/oauth/register.html", 302)
+            req.set_cookie("r5ckip2PFs3w6JK_uid", user_id)
+            req.set_cookie("r5ckip2PFs3w6JK_token", secret)
+            return req
         else:
             return await encore_make_login(account.userName)
+
+OAUTH_REGISTER_HTML = open('./oauth-register.html', "r", encoding="utf-8").read()
+@http.get("/yunhubot/oauth/register.html")
+async def oauth_register_page(req: fastapi.Request):
+    if "r5ckip2PFs3w6JK_uid" not in req.cookies or not re.match(r"^[1-9][0-9]+$", req.cookies["r5ckip2PFs3w6JK_uid"]):
+        return RedirectResponse("/", 302)
+    if "r5ckip2PFs3w6JK_token" not in req.cookies or not re.match(r"^[0-9a-zA-Z]{32}$", req.cookies["r5ckip2PFs3w6JK_token"]):
+        return RedirectResponse("/", 302)
+    async with Session() as session:
+        uid = int(req.cookies["r5ckip2PFs3w6JK_uid"])
+        secret = req.cookies["r5ckip2PFs3w6JK_token"]
+        if (p := await session.scalar(
+            sa.select(OAuthRegisterToken)
+            .where(OAuthRegisterToken.uid == uid)
+            .where(OAuthRegisterToken.secret == secret)
+        )) is None:
+            return RedirectResponse("/", 302)
+        if (m := await session.scalar(sa.select(Registration).where(Registration.yunhuId == uid))) is not None:
+            await session.delete(p)
+            await session.commit()
+            return await encore_make_login(m.userName)
+    return HTMLResponse(OAUTH_REGISTER_HTML.replace("{{YUNHU_UID}}", str(uid)))
+
+@http.get("/yunhubot/oauth/register-api")
+async def oauth_register_page(req: fastapi.Request, username: str):
+    if not NAME_MATCH.match(username):
+        return {"code": "name_invalid"}
+    if "r5ckip2PFs3w6JK_uid" not in req.cookies or not INT_MATCH.match(req.cookies["r5ckip2PFs3w6JK_uid"]):
+        return {"code": "unauthorized"}
+    if "r5ckip2PFs3w6JK_token" not in req.cookies or not re.match(r"^[0-9a-zA-Z]{32}$", req.cookies["r5ckip2PFs3w6JK_token"]):
+        return {"code": "unauthorized"}
+    async with Session() as session:
+        uid = int(req.cookies["r5ckip2PFs3w6JK_uid"])
+        secret = req.cookies["r5ckip2PFs3w6JK_token"]
+        if (p := await session.scalar(
+            sa.select(OAuthRegisterToken)
+            .where(OAuthRegisterToken.uid == uid)
+            .where(OAuthRegisterToken.secret == secret)
+        )) is None:
+            return RedirectResponse("/", 302)
+        if (m := await session.scalar(sa.select(Registration).where(Registration.yunhuId == uid))) is not None:
+            username = m.userName
+        else:
+            if (m := await session.scalar(sa.select(Registration).where(Registration.userName == username))) is not None:
+                return {"code": "name_conflict"}
+            ok, mid = await eapis.createAccount(username, secret[:15], miRootSec)
+            if ok == "duplicate":
+                return {"code": "name_conflict"}
+            elif ok != "ok":
+                return {"code": "fatal"}
+            session.add(Registration(
+                userId=mid,
+                userName=username,
+                yunhuId=uid,
+                robotOwner=uid,
+            ))
+        await session.delete(p)
+        rid = (int(time.time() * 1000 - 1767787667721) << 10) + random.randrange(0, 2048)
+        secret = ''.join(random.choice('1234567890qwertyuiopasdfghjklzxcvbnmQWERTYUIOPASDFGHJKLMNBVCXZ') for _ in range(0, 32))
+        session.add(LoginRequests(
+            rid=rid,
+            secret=secret,
+            userName=username,
+        ))
+        await session.commit()
+        return {"code": "ok", "rid": rid, "secret": secret}
 
 @http.get('/nodeinfo/{version}')
 def nodeinfo(version: str):

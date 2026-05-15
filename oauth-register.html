@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html>
+    <head>
+        <meta charset="utf-8"/>
+        <title>注册</title>
+        <script>
+            function invokeRegister(){
+                let username = document.getElementById("cl_username").value;
+                if(!(/^[a-z0-9]{3,20}$/).test(username)){
+                    alert("名称不合法！"); return;
+                }
+                fetch("/yunhubot/oauth/register-api?username=" + username.toLowerCase())
+                .then((w)=>{return w.json();})
+                .then((e)=>{
+                    switch(e){
+                        case "name_invalid":
+                            alert("名称不合法！");
+                        break;
+                        case "unauthorized":
+                            alert("Token已过期！");
+                            location.assign("/");
+                        break;
+                        case "name_conflict":
+                            alert("名称已被注册！");
+                        break;
+                        case "ok":
+                            location.assign("/yunhubot/vslogin/" + e.rid + "/" + e.secret);
+                        break;
+                        default:
+                            alert("系统错误！");
+                    }
+                })
+            }
+        </script>
+    </head>
+    <body>
+        <h1>注册</h1>
+        <hr/>
+        <table>
+            <tr><td>云湖账户ID：</td><td>{{YUNHU_UID}}</td></tr>
+            <tr><td>联邦宇宙名称：</td><td><input id="cl_username"/><span style="display: inline-block; padding-left: 3px;">@ars.lilingyi-awa.top</span></td></tr>
+            <tr><td></td><td><button onclick="invokeRegister()">注册</button></td></tr>
+        </table>
+        <hr/>
+        <p>云湖QSpace. Copyright &copy; 2026-present 何明。</p>
+        <p>本系统为第三方社区项目，与九万智达公司无关。</p>
+    </body>
+</html>
