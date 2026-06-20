@@ -182,6 +182,36 @@ async def rescue(uid: int):
             message="未知错误，请联系管理员！",
         )
 
+async def safelockdown(uid: int):
+    async with Session() as session:
+        if (prereg := await session.scalar(sa.select(Registration).where(Registration.yunhuId == uid))) is None:
+            await eapis.deliverMessage(
+                uid=uid,
+                message="您并未创建账户！",
+            )
+            return
+    try:
+        async with mi_engine.begin() as engine:
+            ntoken = "".join(random.choice("qwertyuiopasdfghjklzxcvbnm1234567890QWERTYUIOPASDFGHJKLZXCVBNM") for _ in range(0, 16))
+            await engine.execute(
+                sa.text('UPDATE "user" SET "token" = :newtoken WHERE "id" = :userid'),
+                {"userid": prereg.userId, "newtoken": ntoken},
+            )
+            await engine.execute(
+                sa.text('UPDATE "user_profile" SET "password" = \'lockdowned\' WHERE "userId" = :userid'),
+                {"userid": prereg.userId},
+            )
+            await engine.commit()
+        await eapis.deliverMessage(
+            uid=uid,
+            message=f"账户落锁成功！",
+        )
+    except Exception:
+        await eapis.deliverMessage(
+            uid=uid,
+            message="未知错误，请联系管理员！",
+        )
+
 async def whoami(uid: int):
     async with Session() as session:
         if (prereg := await session.scalar(sa.select(Registration).where(Registration.yunhuId == uid))) is None:
@@ -261,6 +291,8 @@ async def accept(req: fastapi.Request, secret: str):
                 code["event"]["sender"]["senderNickname"],
                 code["event"]["message"]["content"]["text"]
             ))
+        if code["event"]["message"]["commandId"] == 2441:
+            asyncio.create_task(safelockdown(int(code["event"]["sender"]["senderId"])))
     if code["header"]["eventType"] == "bot.shortcut.menu":
         if code["event"]["menuId"] == "VO9SDAQ9":
             asyncio.create_task(quicklogin(int(code["event"]["senderId"])))
@@ -551,45 +583,6 @@ async def oauth_register_page(req: fastapi.Request, username: str):
         ))
         await session.commit()
         return {"code": "ok", "rid": rid, "secret": secret}
-
-@http.get('/nodeinfo/{version}')
-def nodeinfo(version: str):
-    return fastapi.responses.JSONResponse({
-        "version": version,
-        "software": {
-            "name": "sinokey",
-            "version": "2026.3.1-liliko",
-            "homepage": "https://misskey-social.com.cn"
-        },
-        "protocols": [
-            "activitypub",
-        ],
-        "services": {
-            "inbound": [],
-            "outbound": [
-                "atom1.0",
-                "rss2.0"
-            ]
-        },
-        "openRegistrations": True,
-        "metadata": {
-            "nodeName": "lilikoBBS",
-            "nodeDescription": "lilikoBBS（aka. 云湖QSpace）是一个普通的联邦宇宙实例。",
-            "nodeAdmins": [
-                {
-                    "name": "Prenext Inc.",
-                    "email": "alan_sudo@yeah.net"
-                }
-            ],
-            "maintainer": {
-                "name": "Prenext Inc.",
-                "email": "alan_sudo@yeah.net"
-            },
-            "langs": ["zh"],
-        },
-    }, headers={
-        "Content-Type": f"application/json; profile=\"http://nodeinfo.diaspora.software/ns/schema/{version}#\"; charset=utf-8",
-    })
 
 if __name__ == "__main__":
     import uvicorn
