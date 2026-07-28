@@ -9,12 +9,13 @@ import eapis
 import re
 import random
 from contextlib import asynccontextmanager
-from fastapi.responses import RedirectResponse, HTMLResponse
+from fastapi.responses import RedirectResponse, HTMLResponse, JSONResponse
 import typing
 import time
 import json
 import aiohttp
 from urllib.parse import quote
+import hashlib
 
 ORMBase = type("ORMBase", (DeclarativeBase, ), {})
 engine = create_async_engine(SQLALCHEMY_URL)
@@ -38,29 +39,35 @@ http = fastapi.FastAPI(lifespan=lifespan)
 
 class Registration(ORMBase):
     __tablename__ = "registration"
-    userName: str = sa.Column(sa.String(45).with_variant(sa.String(45, 'ascii_bin'), 'mysql', 'mariadb'), primary_key=True)
-    yunhuId: typing.Optional[int] = sa.Column(sa.BigInteger(), nullable=True, unique=True)
-    robotOwner: typing.Optional[int] = sa.Column(sa.BigInteger(), nullable=True)
-    userId: str = sa.Column(sa.String(45).with_variant(sa.String(45, 'ascii_bin'), 'mysql', 'mariadb'), nullable=True, unique=True)
+    userName = sa.Column(sa.String(45).with_variant(sa.String(45, 'ascii_bin'), 'mysql', 'mariadb'), primary_key=True)
+    yunhuId = sa.Column(sa.BigInteger(), nullable=True, unique=True)
+    robotOwner = sa.Column(sa.BigInteger(), nullable=True)
+    userId = sa.Column(sa.String(45).with_variant(sa.String(45, 'ascii_bin'), 'mysql', 'mariadb'), nullable=True, unique=True)
 
 class LoginRequests(ORMBase):
     __tablename__ = "login_request"
-    rid: int = sa.Column(sa.BigInteger(), primary_key=True, autoincrement=False)
-    secret: str = sa.Column(sa.String(32).with_variant(sa.String(32, 'ascii_bin'), 'mysql', 'mariadb'), nullable=False)
-    userName: str = sa.Column(sa.Text(), nullable=False)
-    expires: int = sa.Column(sa.BigInteger(), nullable=False, default=lambda: int(time.time()) + 600)
+    rid = sa.Column(sa.BigInteger(), primary_key=True, autoincrement=False)
+    secret = sa.Column(sa.String(32).with_variant(sa.String(32, 'ascii_bin'), 'mysql', 'mariadb'), nullable=False)
+    userName = sa.Column(sa.Text(), nullable=False)
+    expires = sa.Column(sa.BigInteger(), nullable=False, default=lambda: int(time.time()) + 600)
 
 class OAuthRequests(ORMBase):
     __tablename__ = "oauth_request"
-    rid1: int = sa.Column(sa.BigInteger(), primary_key=True, autoincrement=False)
-    rid2: str = sa.Column(sa.String(32).with_variant(sa.String(32, 'ascii_bin'), 'mysql', 'mariadb'), primary_key=True)
-    expires: int = sa.Column(sa.BigInteger(), nullable=False, default=lambda: int(time.time()) + 600)
+    rid1 = sa.Column(sa.BigInteger(), primary_key=True, autoincrement=False)
+    rid2 = sa.Column(sa.String(32).with_variant(sa.String(32, 'ascii_bin'), 'mysql', 'mariadb'), primary_key=True)
+    expires = sa.Column(sa.BigInteger(), nullable=False, default=lambda: int(time.time()) + 600)
 
 class OAuthRegisterToken(ORMBase):
     __tablename__ = "oauth_register_token"
-    uid: int = sa.Column(sa.BigInteger(), primary_key=True, autoincrement=False)
-    secret: str = sa.Column(sa.String(32).with_variant(sa.String(32, 'ascii_bin'), 'mysql', 'mariadb'), nullable=False)
-    expires: int = sa.Column(sa.BigInteger(), nullable=False, default=lambda: int(time.time()) + 600)
+    uid = sa.Column(sa.BigInteger(), primary_key=True, autoincrement=False)
+    secret = sa.Column(sa.String(32).with_variant(sa.String(32, 'ascii_bin'), 'mysql', 'mariadb'), nullable=False)
+    expires = sa.Column(sa.BigInteger(), nullable=False, default=lambda: int(time.time()) + 600)
+
+class ClientLoginToken(ORMBase):
+    __tablename__ = "client_login_token"
+    uid = sa.Column(sa.BigInteger(), primary_key=True, autoincrement=False)
+    token_sha256 = sa.Column(sa.String(64).with_variant(sa.String(64, 'ascii_bin'), 'mysql', 'mariadb'), primary_key=True)
+    expires = sa.Column(sa.BigInteger(), nullable=False, default=lambda: int(time.time()) + 600)
 
 async def expire_clearer():
     while True:
@@ -260,6 +267,17 @@ async def accept_fun_request(uid: int, name: str, content: str):
         message=f"收到申请！\n申请者：{name}（{uid}）\n申请内容：\n{content}",
     )
 
+CLIENT_REGISTER_MATCH = re.compile(r"^client-register:([a-f0-9]{64})$")
+
+async def attach_client_login(user_uid: int, token_sha256: str):
+    async with Session() as session:
+        await session.merge(ClientLoginToken(
+            uid=user_uid,
+            token_sha256=token_sha256,
+            expires=int(time.time()) + 600,
+        ))
+        await session.commit()
+
 @http.post("/yunhubot/receive")
 async def accept(req: fastapi.Request, secret: str):
     if secret != YUNHU_VERIFY_KEY:
@@ -293,9 +311,48 @@ async def accept(req: fastapi.Request, secret: str):
             ))
         if code["event"]["message"]["commandId"] == 2441:
             asyncio.create_task(safelockdown(int(code["event"]["sender"]["senderId"])))
+    if code["header"]["eventType"] == "message.receive.normal":
+        if code["event"]["message"]["contentType"] == "text":
+            text = code["event"]["message"]["content"]["text"]
+            if (m := CLIENT_REGISTER_MATCH.match(text)):
+                asyncio.create_task(attach_client_login(int(code["event"]["sender"]["senderId"]), m.group(1)))
     if code["header"]["eventType"] == "bot.shortcut.menu":
         if code["event"]["menuId"] == "VO9SDAQ9":
             asyncio.create_task(quicklogin(int(code["event"]["senderId"])))
+
+@http.get("/yunhubot/thirdapp/login")
+async def get_login(req: fastapi.Request, yunhuID: int, username: str = ""):
+    if not req.headers.get("Authorization", "").startswith("Bearer "):
+        return JSONResponse({"status": 401, "signal": "INVALID_REQUEST"}, 401)
+    token = hashlib.sha256(req.headers.get("Authorization", "").removeprefix("Bearer ").encode("utf-8")).digest()
+    async with Session() as session:
+        uid = await session.scalar(
+            sa.select(ClientLoginToken.uid)
+            .where(ClientLoginToken.uid == yunhuID)
+            .where(ClientLoginToken.token_sha256 == token)
+        )
+        if uid is None:
+            return JSONResponse({"status": 401, "signal": "TOKEN_NOT_EXISTS"}, 401)
+        account = await session.scalar(sa.select(Registration.userName).where(Registration.yunhuId == uid))
+    if account is not None:
+        return JSONResponse({"status": 200, "signal": "FOUNDED", "username": account, "token": await get_misskey_utoken(account)})
+    if username == "":
+        return JSONResponse({"status": 404, "signal": "NEED_REGISTER"}, 404)
+    if not NAME_MATCH.match(username):
+        return JSONResponse({"status": 400, "signal": "INVALID_USERNAME"}, 400)
+    random_pwd = "".join(random.choice("1234567890qwertyuiopasdfghjklzxcvbnmQWERTYUIOPASDFGHJKLZXCVBNM") for _ in range(0, 32))
+    result, userId = await eapis.createAccount(username, random_pwd, miRootSec)
+    if result == "duplicate":
+        return JSONResponse({"status": 400, "signal": "DUPLICATED_USERNAME"}, 400)
+    async with Session() as session:
+        session.add(Registration(
+            userName=username,
+            userId=userId,
+            yunhuId=yunhuID,
+            robotOwner=yunhuID,
+        ))
+        await session.commit()
+    return JSONResponse({"status": 200, "signal": "REGISTERED", "username": username, "token": await get_misskey_utoken(username)})
 
 @http.get("/identicon/{name}")
 async def identicon(name: str):
