@@ -324,7 +324,7 @@ async def accept(req: fastapi.Request, secret: str):
 async def get_login(req: fastapi.Request, yunhuID: int, username: str = ""):
     if not req.headers.get("Authorization", "").startswith("Bearer "):
         return JSONResponse({"status": 401, "signal": "INVALID_REQUEST"}, 401)
-    token = hashlib.sha256(req.headers.get("Authorization", "").removeprefix("Bearer ").encode("utf-8")).digest()
+    token = hashlib.sha256(req.headers.get("Authorization", "").removeprefix("Bearer ").encode("utf-8")).hexdigest()
     async with Session() as session:
         uid = await session.scalar(
             sa.select(ClientLoginToken.uid)
