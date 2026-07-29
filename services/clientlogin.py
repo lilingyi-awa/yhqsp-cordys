@@ -52,3 +52,34 @@ async def thirdapp_login(req: fastapi.Request, yunhuID: int, username: str = "")
         ))
         await session.commit()
     return JSONResponse({"status": 200, "signal": "REGISTERED", "username": username, "token": await get_misskey_utoken(username)})
+
+@http.get("/yunhubot/thirdapp/userinfo/{username}")
+async def getUser(username: str):
+    async with Session() as session:
+        result = await session.scalar(
+            sa.select(Registration)
+            .where(Registration.userName == username)
+        )
+        if result is None:
+            return JSONResponse({"code": 404}, 404)
+        return JSONResponse({"code": 200, "info": {
+            "yunhu_uid": result.robotOwner,
+            "type": ("person" if (result.yunhuId is not None) else "ias"),
+        }})
+
+@http.get("/yunhubot/thirdapp/numberinfo/{uid}")
+async def getNumber(uid: int):
+    async with Session() as session:
+        result = await session.scalar(
+            sa.select(Registration.userName)
+            .where(Registration.yunhuId == uid)
+        )
+        iasList = await session.execute(
+            sa.select(Registration.userName)
+            .where(Registration.robotOwner == uid)
+            .where(Registration.yunhuId == None)
+        )
+        iasList = [i._tuple()[0] for i in iasList]
+        if result is None:
+            return JSONResponse({"code": 404}, 404)
+        return JSONResponse({"code": 200, "username": result, "ias": iasList})
