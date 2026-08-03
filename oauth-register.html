@@ -12,7 +12,7 @@
                 fetch("/yunhubot/oauth/register-api?username=" + username.toLowerCase())
                 .then((w)=>{return w.json();})
                 .then((e)=>{
-                    switch(e){
+                    switch(e.code){
                         case "name_invalid":
                             alert("名称不合法！");
                         break;
