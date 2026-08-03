@@ -15,6 +15,10 @@
   - `contents.py`：内容管理操作
 - `main.py`：系统初始化逻辑
 
+## 注意事项
+
+**⚠ 我们建议您最好不要使用这套代码，因为这就是坨屎山。**
+
 ## 版权声明
 
-版权所有 © 2026-至今 「Vsinger小冰」企划组。以 GNU AGPL 3.0 开源协议发布。
+版权所有 © 2026-至今 [「Vsinger小冰」企划理事会](https://matrix.to/#/#vxiaoiceproject:millions.bridge18.qzz.io)。以 GNU AGPL 3.0 开源协议发布。
