@@ -8,17 +8,18 @@ import sqlalchemy as sa
 
 @http.get("/identicon/{name}")
 async def identicon(name: str):
+    ecp = name
     if name == "":
-        return RedirectResponse("https://arisnet.top/q-identicon/icon/" + name)
+        return RedirectResponse("https://arisnet.top/q-identicon/icon/" + name, 302)
     name = name.split("@")
     if len(name) != 2 or name[1] != MISSKEY_DOMAIN:
-        return RedirectResponse("https://arisnet.top/q-identicon/icon/" + name)
+        return RedirectResponse("https://arisnet.top/q-identicon/icon/" + ecp, 302)
     name = name[0]
     async with Session() as session:
         if (prereg := await session.scalar(sa.select(Registration).where(Registration.userName == name))) is None:
-            return RedirectResponse("https://arisnet.top/q-identicon/icon/" + name)
+            return RedirectResponse("https://arisnet.top/q-identicon/icon/" + ecp, 302)
         if prereg.yunhuId is None:
-            return RedirectResponse("https://arisnet.top/q-identicon/icon/" + name)
+            return RedirectResponse("https://arisnet.top/q-identicon/icon/" + ecp, 302)
         return RedirectResponse(await eapis.getAvatarUrl(prereg.yunhuId))
 
 @http.get("/files/{webpublickey}")
